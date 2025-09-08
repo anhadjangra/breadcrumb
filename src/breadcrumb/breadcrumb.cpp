@@ -20,6 +20,15 @@ Breadcrumb::Breadcrumb() :
 
 	dyncfg_settings_.setCallback(boost::bind(&Breadcrumb::callback_cfg_settings, this, _1, _2));
 
+	// Bounds (mission limits)
+	nhp_.param("enforce_bounds", enforce_bounds_, false);
+	nhp_.param("x_min", x_min_, x_min_);
+	nhp_.param("x_max", x_max_, x_max_);
+	nhp_.param("y_min", y_min_, y_min_);
+	nhp_.param("y_max", y_max_, y_max_);
+	nhp_.param("z_min", z_min_, z_min_);
+	nhp_.param("z_max", z_max_, z_max_);
+
 	sub_grid_ = nhp_.subscribe<nav_msgs::OccupancyGrid>( "grid", 10, &Breadcrumb::callback_grid, this );
 
 	ROS_INFO("[Breadcrumb] Waiting for occupancy grid");
@@ -63,10 +72,41 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 	if( param_calc_sparse_ )
 		res.path_sparse.header = res.path.header;
 
+	if (enforce_bounds_) {
+	    req.start.x = clamp_(req.start.x, x_min_, x_max_);
+	    req.start.y = clamp_(req.start.y, y_min_, y_max_);
+	    req.end.x   = clamp_(req.end.x,   x_min_, x_max_);
+	    req.end.y   = clamp_(req.end.y,   y_min_, y_max_);
+	}
+
 	int start_i = (int)( (req.start.x - map_info_.origin.position.x) / map_info_.resolution);
 	int start_j = (int)( (req.start.y - map_info_.origin.position.y) / map_info_.resolution);
 	int end_i = (int)( (req.end.x - map_info_.origin.position.x) / map_info_.resolution);
 	int end_j = (int)( (req.end.y - map_info_.origin.position.y) / map_info_.resolution);
+
+	// If start/end are in collision (or outside masked box), snap to nearest free cell
+	int si = start_i, sj = start_j, ei = end_i, ej = end_j;
+	
+	if (astar_.detectCollision({si, sj})) {
+	    if (!snapToNearestFree_(si, sj)) {
+	        ROS_ERROR("[Breadcrumb] Requested start is within an obstacle and no nearby free cell inside bounds");
+	        return true; // keep service reply semantics
+	    }
+	    // update clamped world too (optional)
+	    cellToWorld_(si, sj, req.start.x, req.start.y);
+	}
+	
+	if (astar_.detectCollision({ei, ej})) {
+	    if (!snapToNearestFree_(ei, ej)) {
+	        ROS_ERROR("[Breadcrumb] Requested end is within an obstacle and no nearby free cell inside bounds");
+	        return true;
+	    }
+	    cellToWorld_(ei, ej, req.end.x, req.end.y);
+	}
+	
+	// overwrite the i/j we pass into A*
+	start_i = si; start_j = sj;
+	end_i   = ei; end_j   = ej;
 
 	ROS_DEBUG("[Breadcrumb] Start/End: [%i, %i]; [%i, %i]", start_i, start_j, end_i, end_j);
 
@@ -104,7 +144,8 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 				//Calculate position in the parent frame
 				step.position.x = (path[k].x * map_info_.resolution) + (map_info_.resolution / 2) + map_info_.origin.position.x;
 				step.position.y = (path[k].y * map_info_.resolution) + (map_info_.resolution / 2) + map_info_.origin.position.y;
-				step.position.z = req.start.z;
+				const double z_path = enforce_bounds_ ? clamp_(req.start.z, z_min_, z_max_) : req.start.z;
+				step.position.z = z_path;
 
 				//Fill in the rotation data
 				if(k > 0) {
@@ -192,12 +233,26 @@ void Breadcrumb::callback_grid(const nav_msgs::OccupancyGrid::ConstPtr& msg_in) 
 	astar_.clearCollisions();
 
 	//Add in the new obstacles
-	for(int j=0; j<msg_in->info.height; j++) {
-		for(int i=0; i<msg_in->info.width; i++) {
-			//If the obstacle is above the acceptable threshold, add it as an obstacle
-			if(msg_in->data[i + (j*msg_in->info.width)] > param_obstacle_threshold_)
-				astar_.addCollision({i,j});
-		}
+	for (int j = 0; j < (int)msg_in->info.height; ++j) {
+	    for (int i = 0; i < (int)msg_in->info.width; ++i) {
+	        const int idx = i + j * msg_in->info.width;
+	        // world center of this cell
+	        double wx = (i + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.x;
+	        double wy = (j + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.y;
+	
+	        bool out_of_box = false;
+	        if (enforce_bounds_) {
+	            out_of_box = (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_);
+	        }
+	
+	        const int v = msg_in->data[idx];           // -1 unknown, 0..100 known
+	        const bool unknown = (v < 0);
+	        const bool occupied = (v > param_obstacle_threshold_);
+	
+	        if (out_of_box || unknown || occupied) {
+	            astar_.addCollision({i, j});
+	        }
+	    }
 	}
 
 	if(!flag_got_grid_) {
@@ -205,4 +260,37 @@ void Breadcrumb::callback_grid(const nav_msgs::OccupancyGrid::ConstPtr& msg_in) 
 		srv_request_path_ = nhp_.advertiseService("request_path", &Breadcrumb::request_path, this);
 		ROS_INFO("[Breadcrumb] Received a new occupancy grid, path planning service started!");
 	}
+}
+
+bool Breadcrumb::snapToNearestFree_(int& i, int& j) const {
+    // Already free?
+    if (!astar_.detectCollision({i, j})) return true;
+
+    const int max_r = 50; // ~5m if resolution = 0.1
+    for (int r = 1; r <= max_r; ++r) {
+        for (int dx = -r; dx <= r; ++dx) {
+            for (int dy = -r; dy <= r; ++dy) {
+                // ring (prefer border of the square)
+                if (std::abs(dx) != r && std::abs(dy) != r) continue;
+
+                const int ni = i + dx;
+                const int nj = j + dy;
+
+                if (ni < 0 || nj < 0 ||
+                    ni >= (int)map_info_.width || nj >= (int)map_info_.height) continue;
+
+                // check world bounds if enforced (though the grid has been masked already)
+                if (enforce_bounds_) {
+                    double wx, wy; cellToWorld_((int)ni, (int)nj, wx, wy);
+                    if (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_) continue;
+                }
+
+                if (!astar_.detectCollision({ni, nj})) {
+                    i = ni; j = nj;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
