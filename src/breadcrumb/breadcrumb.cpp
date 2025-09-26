@@ -73,10 +73,10 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 		res.path_sparse.header = res.path.header;
 
 	if (enforce_bounds_) {
-	    req.start.x = clamp_(req.start.x, x_min_, x_max_);
-	    req.start.y = clamp_(req.start.y, y_min_, y_max_);
-	    req.end.x   = clamp_(req.end.x,   x_min_, x_max_);
-	    req.end.y   = clamp_(req.end.y,   y_min_, y_max_);
+		req.start.x = clamp_(req.start.x, x_min_, x_max_);
+		req.start.y = clamp_(req.start.y, y_min_, y_max_);
+		req.end.x   = clamp_(req.end.x,   x_min_, x_max_);
+		req.end.y   = clamp_(req.end.y,   y_min_, y_max_);
 	}
 
 	int start_i = (int)( (req.start.x - map_info_.origin.position.x) / map_info_.resolution);
@@ -88,20 +88,20 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 	int si = start_i, sj = start_j, ei = end_i, ej = end_j;
 	
 	if (astar_.detectCollision({si, sj})) {
-	    if (!snapToNearestFree_(si, sj)) {
-	        ROS_ERROR("[Breadcrumb] Requested start is within an obstacle and no nearby free cell inside bounds");
-	        return true; // keep service reply semantics
-	    }
-	    // update clamped world too (optional)
-	    cellToWorld_(si, sj, req.start.x, req.start.y);
+		if (!snapToNearestFree_(si, sj)) {
+			ROS_ERROR("[Breadcrumb] Requested start is within an obstacle and no nearby free cell inside bounds");
+			return true; // keep service reply semantics
+		}
+		// update clamped world too (optional)
+		cellToWorld_(si, sj, req.start.x, req.start.y);
 	}
 	
 	if (astar_.detectCollision({ei, ej})) {
-	    if (!snapToNearestFree_(ei, ej)) {
-	        ROS_ERROR("[Breadcrumb] Requested end is within an obstacle and no nearby free cell inside bounds");
-	        return true;
-	    }
-	    cellToWorld_(ei, ej, req.end.x, req.end.y);
+		if (!snapToNearestFree_(ei, ej)) {
+			ROS_ERROR("[Breadcrumb] Requested end is within an obstacle and no nearby free cell inside bounds");
+			return true;
+		}
+		cellToWorld_(ei, ej, req.end.x, req.end.y);
 	}
 	
 	// overwrite the i/j we pass into A*
@@ -226,33 +226,77 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 void Breadcrumb::callback_grid(const nav_msgs::OccupancyGrid::ConstPtr& msg_in) {
 	frame_id_ = msg_in->header.frame_id;
 	map_info_ = msg_in->info;
-
-    astar_.setWorldSize({(int)msg_in->info.width, (int)msg_in->info.height});
-
-	//Clean up obstacles
+	astar_.setWorldSize({(int)msg_in->info.width, (int)msg_in->info.height});
 	astar_.clearCollisions();
 
-	//Add in the new obstacles
+	// 1) Collect occupied cells first (so we can inflate them)
+	std::vector<std::pair<int,int>> occupied_cells;
+	occupied_cells.reserve(msg_in->info.width * msg_in->info.height / 10);
+
 	for (int j = 0; j < (int)msg_in->info.height; ++j) {
-	    for (int i = 0; i < (int)msg_in->info.width; ++i) {
-	        const int idx = i + j * msg_in->info.width;
-	        // world center of this cell
-	        double wx = (i + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.x;
-	        double wy = (j + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.y;
-	
-	        bool out_of_box = false;
-	        if (enforce_bounds_) {
-	            out_of_box = (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_);
-	        }
-	
-	        const int v = msg_in->data[idx];           // -1 unknown, 0..100 known
-	        const bool unknown = (v < 0);
-	        const bool occupied = (v > param_obstacle_threshold_);
-	
-	        if (out_of_box || unknown || occupied) {
-	            astar_.addCollision({i, j});
-	        }
-	    }
+		for (int i = 0; i < (int)msg_in->info.width; ++i) {
+			const int idx = i + j * msg_in->info.width;
+
+			// World center (for bounds mask)
+			double wx = (i + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.x;
+			double wy = (j + 0.5) * msg_in->info.resolution + msg_in->info.origin.position.y;
+
+			bool out_of_box = false;
+			if (enforce_bounds_) {
+				out_of_box = (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_);
+			}
+
+			const int v = msg_in->data[idx];           // -1 unknown, 0..100 known
+			const bool unknown  = (v < 0);
+			const bool occupied = (v > param_obstacle_threshold_);
+
+			// Treat unknown/occupied/out_of_box as "base obstacles"
+			if (out_of_box || unknown || occupied) {
+				occupied_cells.emplace_back(i, j);
+			}
+		}
+	}
+
+	// 2) Inflate those cells by a fixed radius in meters
+	const double INFLATE_M = 0.2; // desired extra clearance
+	const int r = std::max(1, (int)std::ceil(INFLATE_M / msg_in->info.resolution));
+	const int W = (int)msg_in->info.width;
+	const int H = (int)msg_in->info.height;
+
+	// Optional: mask to avoid duplicate inserts
+	std::vector<uint8_t> mask(W * H, 0);
+
+	// Seed mask with the base occupied cells
+	for (auto [i,j] : occupied_cells) {
+		if (i >= 0 && i < W && j >= 0 && j < H) mask[i + j*W] = 1;
+	}
+
+	// Grow each obstacle by 'r' cells (disc-shaped neighborhood)
+	for (auto [ci,cj] : occupied_cells) {
+		for (int dj = -r; dj <= r; ++dj) {
+			for (int di = -r; di <= r; ++di) {
+				if (di*di + dj*dj > r*r) continue; // circle
+				int ni = ci + di, nj = cj + dj;
+				if (ni < 0 || ni >= W || nj < 0 || nj >= H) continue;
+
+				// (Optional) keep the bounds mask strict:
+				if (enforce_bounds_) {
+					double wx, wy; cellToWorld_(ni, nj, wx, wy);
+					if (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_) continue;
+				}
+
+				mask[ni + nj*W] = 1;
+			}
+		}
+	}
+
+	// 3) Commit the inflated obstacles to A*
+	for (int j = 0; j < H; ++j) {
+		for (int i = 0; i < W; ++i) {
+			if (mask[i + j*W]) {
+				astar_.addCollision({i, j});
+			}
+		}
 	}
 
 	if(!flag_got_grid_) {
@@ -263,34 +307,34 @@ void Breadcrumb::callback_grid(const nav_msgs::OccupancyGrid::ConstPtr& msg_in) 
 }
 
 bool Breadcrumb::snapToNearestFree_(int& i, int& j) const {
-    // Already free?
-    if (!astar_.detectCollision({i, j})) return true;
+	// Already free?
+	if (!astar_.detectCollision({i, j})) return true;
 
-    const int max_r = 50; // ~5m if resolution = 0.1
-    for (int r = 1; r <= max_r; ++r) {
-        for (int dx = -r; dx <= r; ++dx) {
-            for (int dy = -r; dy <= r; ++dy) {
-                // ring (prefer border of the square)
-                if (std::abs(dx) != r && std::abs(dy) != r) continue;
+	const int max_r = 50; // ~5m if resolution = 0.1
+	for (int r = 1; r <= max_r; ++r) {
+		for (int dx = -r; dx <= r; ++dx) {
+			for (int dy = -r; dy <= r; ++dy) {
+				// ring (prefer border of the square)
+				if (std::abs(dx) != r && std::abs(dy) != r) continue;
 
-                const int ni = i + dx;
-                const int nj = j + dy;
+				const int ni = i + dx;
+				const int nj = j + dy;
 
-                if (ni < 0 || nj < 0 ||
-                    ni >= (int)map_info_.width || nj >= (int)map_info_.height) continue;
+				if (ni < 0 || nj < 0 ||
+					ni >= (int)map_info_.width || nj >= (int)map_info_.height) continue;
 
-                // check world bounds if enforced (though the grid has been masked already)
-                if (enforce_bounds_) {
-                    double wx, wy; cellToWorld_((int)ni, (int)nj, wx, wy);
-                    if (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_) continue;
-                }
+				// check world bounds if enforced (though the grid has been masked already)
+				if (enforce_bounds_) {
+					double wx, wy; cellToWorld_((int)ni, (int)nj, wx, wy);
+					if (wx < x_min_ || wx > x_max_ || wy < y_min_ || wy > y_max_) continue;
+				}
 
-                if (!astar_.detectCollision({ni, nj})) {
-                    i = ni; j = nj;
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
+				if (!astar_.detectCollision({ni, nj})) {
+					i = ni; j = nj;
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
