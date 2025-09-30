@@ -34,9 +34,9 @@ class Breadcrumb {
 		bool param_calc_sparse_;
 		bool param_theta_star_;
 
-		bool enforce_bounds_ = false;
+		bool enforce_bounds_ = true;
 		double x_min_ = -4, x_max_ = 4;
-		double y_min_ = -2.75, y_max_ = 2.25;
+		double y_min_ = -2.5, y_max_ = 2.0;
 		double z_min_ = 0.5,  z_max_ = 4.0;
 
 

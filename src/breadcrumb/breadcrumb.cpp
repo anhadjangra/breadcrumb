@@ -21,7 +21,7 @@ Breadcrumb::Breadcrumb() :
 	dyncfg_settings_.setCallback(boost::bind(&Breadcrumb::callback_cfg_settings, this, _1, _2));
 
 	// Bounds (mission limits)
-	nhp_.param("enforce_bounds", enforce_bounds_, false);
+	nhp_.param("enforce_bounds", enforce_bounds_, true);
 	nhp_.param("x_min", x_min_, x_min_);
 	nhp_.param("x_max", x_max_, x_max_);
 	nhp_.param("y_min", y_min_, y_min_);
