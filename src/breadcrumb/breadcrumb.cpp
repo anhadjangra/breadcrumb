@@ -144,7 +144,7 @@ bool Breadcrumb::request_path(breadcrumb::RequestPath::Request& req, breadcrumb:
 				//Calculate position in the parent frame
 				step.position.x = (path[k].x * map_info_.resolution) + (map_info_.resolution / 2) + map_info_.origin.position.x;
 				step.position.y = (path[k].y * map_info_.resolution) + (map_info_.resolution / 2) + map_info_.origin.position.y;
-				const double z_path = enforce_bounds_ ? clamp_(req.start.z, z_min_, z_max_) : req.start.z;
+				const double z_path = enforce_bounds_ ? clamp_(req.end.z, z_min_, z_max_) : req.end.z;
 				step.position.z = z_path;
 
 				//Fill in the rotation data
